@@ -54,7 +54,38 @@ CREATE TABLE IF NOT EXISTS analyses (
     created_at       TEXT NOT NULL,
     total_points     INTEGER NOT NULL,
     matched_points   INTEGER NOT NULL,
-    total_distance_m REAL NOT NULL
+    total_distance_m REAL NOT NULL,
+    has_basis        INTEGER NOT NULL DEFAULT 1  -- 1=已落库接续依据;0=历史分析,需重新匹配才能里程复核
+);
+
+-- 接续依据:每对连续采样(同一匹配段内、缺口两侧不接续)一条,
+-- 记录首尾固定片段与全部最短接续路线共用的紧边 DAG(只存边,不枚举路线)。
+CREATE TABLE IF NOT EXISTS analysis_connectors (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL REFERENCES analyses(id),
+    seq         INTEGER NOT NULL,
+    UNIQUE (analysis_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_connector_pieces (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id   INTEGER NOT NULL REFERENCES analyses(id),
+    connector_seq INTEGER NOT NULL,
+    seq           INTEGER NOT NULL,
+    segment_id    TEXT NOT NULL,
+    from_offset_m REAL NOT NULL,
+    to_offset_m   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analysis_connector_edges (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id   INTEGER NOT NULL REFERENCES analyses(id),
+    connector_seq INTEGER NOT NULL,
+    seq           INTEGER NOT NULL,
+    from_node     TEXT NOT NULL,   -- 图节点键 "lat,lon"(1e-6 度精度)
+    to_node       TEXT NOT NULL,
+    segment_id    TEXT NOT NULL,
+    length_m      REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS analysis_segments (
@@ -96,6 +127,10 @@ def init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        # 轻量迁移:为旧库中的 analyses 补 has_basis 列(旧分析无接续依据,置 0)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(analyses)").fetchall()}
+        if "has_basis" not in cols:
+            conn.execute("ALTER TABLE analyses ADD COLUMN has_basis INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     finally:
         conn.close()

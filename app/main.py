@@ -6,9 +6,10 @@
   GET  /api/networks/{v}      查看某版本路网(含路段)
   POST /api/trajectories      提交轨迹(UTC 时刻 + 坐标)
   GET  /api/trajectories/{id} 查看轨迹
-  POST /api/match             在指定路网版本上执行匹配,生成连续路径与缺口
+  POST /api/match             在指定路网版本上执行匹配,生成连续路径、缺口与接续依据
   GET  /api/analyses          按路网版本 / 轨迹查询历史分析
   GET  /            /api/analyses/{id} 查看分析结果(匹配路段、进入/离开时刻、里程、缺口原因)
+  POST /api/analyses/{id}/mileage-review 里程复核:依据已存接续依据计算指定路段集上的最少/最多里程
 """
 from __future__ import annotations
 
@@ -16,9 +17,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 
-from . import db
-from .matcher import NetworkIndex, Segment, TrackPoint
-from .schemas import MatchRequest, NetworkCreate, TrajectoryCreate
+from . import db, review
+from .matcher import NetworkIndex, Segment, TrackPoint, node_key_str
+from .schemas import MatchRequest, NetworkCreate, ReviewRequest, TrajectoryCreate
 from .util import fmt_ts, parse_ts, utcnow
 
 
@@ -30,22 +31,33 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="车辆轨迹匹配 API", version="1.0.0", lifespan=lifespan)
 
-# 路网版本快照缓存:(db_path, network_id) -> NetworkIndex
-# 路网版本登记后不可变,因此缓存安全;匹配全程只使用同一快照,不路网修订不影响进行中的分析。
-_index_cache: dict[tuple[str, int], NetworkIndex] = {}
+# 路网版本快照缓存:(db_path, network_id) -> (快照签名, NetworkIndex)
+# 路网版本登记后不可变,因此缓存安全;匹配全程只使用同一快照,路网修订不影响进行中的分析。
+# 签名用于防御性校验:同一 id 的缓存必须与当前库中的路段快照一致。
+_index_cache: dict[tuple[str, int], tuple[tuple, NetworkIndex]] = {}
+
+
+def _snapshot_signature(seg_rows) -> tuple:
+    return tuple(
+        (r["segment_id"], r["start_lat"], r["start_lon"], r["end_lat"],
+         r["end_lon"], r["length_m"])
+        for r in seg_rows
+    )
 
 
 def get_index(network_id: int, seg_rows) -> NetworkIndex:
     key = (db.db_path(), network_id)
-    idx = _index_cache.get(key)
-    if idx is None:
-        segments = [
-            Segment(r["segment_id"], r["start_lat"], r["start_lon"],
-                    r["end_lat"], r["end_lon"], r["length_m"])
-            for r in seg_rows
-        ]
-        idx = NetworkIndex(segments)
-        _index_cache[key] = idx
+    signature = _snapshot_signature(seg_rows)
+    cached = _index_cache.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    segments = [
+        Segment(r["segment_id"], r["start_lat"], r["start_lon"],
+                r["end_lat"], r["end_lon"], r["length_m"])
+        for r in seg_rows
+    ]
+    idx = NetworkIndex(segments)
+    _index_cache[key] = (signature, idx)
     return idx
 
 
@@ -182,11 +194,22 @@ def run_match(body: MatchRequest):
     result = index.match(points)
 
     now = fmt_ts(utcnow())
+    # 解析接续依据中的路段下标为路段号、图节点键为持久化字符串
+    basis_rows = []
+    for basis in result["connector_bases"]:
+        pieces = [(index.segments[si].segment_id, frm, to)
+                  for si, frm, to in basis["pieces"]]
+        edges = [(node_key_str(u), node_key_str(v), index.segments[si].segment_id,
+                  index.segments[si].length_m)
+                 for u, v, si in basis["edges"]]
+        basis_rows.append((pieces, edges))
+
     conn = db.connect()
     try:
+        # 分析与接续依据在同一事务写入:依据写入失败则整体回滚,不生成本次分析
         cur = conn.execute(
             "INSERT INTO analyses (trajectory_id, network_id, created_at, total_points, "
-            "matched_points, total_distance_m) VALUES (?, ?, ?, ?, ?, ?)",
+            "matched_points, total_distance_m, has_basis) VALUES (?, ?, ?, ?, ?, ?, 1)",
             (traj["id"], net["id"], now, result["total_points"],
              result["matched_points"], result["total_distance_m"]),
         )
@@ -203,12 +226,31 @@ def run_match(body: MatchRequest):
             [(aid, g["seq"], g["start_time"], g["end_time"], g["reason"])
              for g in result["gaps"]],
         )
+        for cseq, (pieces, edges) in enumerate(basis_rows):
+            conn.execute(
+                "INSERT INTO analysis_connectors (analysis_id, seq) VALUES (?, ?)",
+                (aid, cseq))
+            conn.executemany(
+                "INSERT INTO analysis_connector_pieces (analysis_id, connector_seq, seq, "
+                "segment_id, from_offset_m, to_offset_m) VALUES (?, ?, ?, ?, ?, ?)",
+                [(aid, cseq, k, sid, frm, to) for k, (sid, frm, to) in enumerate(pieces)],
+            )
+            conn.executemany(
+                "INSERT INTO analysis_connector_edges (analysis_id, connector_seq, seq, "
+                "from_node, to_node, segment_id, length_m) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(aid, cseq, k, u, v, sid, length)
+                 for k, (u, v, sid, length) in enumerate(edges)],
+            )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
+    public = {k: v for k, v in result.items() if k != "connector_bases"}
     return {"analysis_id": aid, "trajectory_id": traj["id"],
-            "network_version": net["version"], "created_at": now, **result}
+            "network_version": net["version"], "created_at": now, **public}
 
 
 @app.get("/api/analyses")
@@ -262,6 +304,78 @@ def get_analysis(analysis_id: int):
                 "gaps": [dict(g) for g in gaps]}
     finally:
         conn.close()
+
+
+@app.post("/api/analyses/{analysis_id}/mileage-review")
+def mileage_review(analysis_id: int, body: ReviewRequest):
+    """里程复核:传入该版路网的一组有向路段号,返回整份分析在这组路段上
+    可能行驶的最少和最多米数。
+
+    - 以原匹配选中的吸附点为准,每对连续采样可各自取任一最短接续路线;
+    - 首尾只计实际经过的里程,缺口两侧不接续;
+    - 只读取匹配时落库的接续依据(固定片段 + 紧边 DAG),不重跑匹配、
+      不重新搜索路网,也不枚举等长路线;换一组路段直接复用同一依据;
+    - 旧分析缺少接续依据时返回 409,提示重新匹配。
+    """
+    conn = db.connect()
+    try:
+        a = conn.execute(
+            "SELECT a.*, n.version AS network_version FROM analyses a "
+            "JOIN networks n ON n.id = a.network_id WHERE a.id = ?", (analysis_id,)
+        ).fetchone()
+        if not a:
+            raise HTTPException(404, f"分析 {analysis_id} 不存在")
+        if not a["has_basis"]:
+            raise HTTPException(
+                409,
+                f"分析 {analysis_id} 生成时未保存接续依据(历史分析),请在该版路网上重新匹配后再复核",
+            )
+        # 路段号必须属于该分析使用的路网版本
+        valid_ids = {
+            r["segment_id"]
+            for r in conn.execute(
+                "SELECT segment_id FROM segments WHERE network_id = ?", (a["network_id"],)
+            ).fetchall()
+        }
+        unknown = [s for s in body.segment_ids if s not in valid_ids]
+        if unknown:
+            raise HTTPException(
+                400,
+                f"路段号不属于路网版本 '{a['network_version']}': {', '.join(unknown)}",
+            )
+        crows = conn.execute(
+            "SELECT seq FROM analysis_connectors WHERE analysis_id = ? ORDER BY seq",
+            (analysis_id,),
+        ).fetchall()
+        connectors = []
+        for cr in crows:
+            cseq = cr["seq"]
+            pieces = [
+                review.Piece(r["segment_id"], r["from_offset_m"], r["to_offset_m"])
+                for r in conn.execute(
+                    "SELECT segment_id, from_offset_m, to_offset_m "
+                    "FROM analysis_connector_pieces WHERE analysis_id = ? AND connector_seq = ? "
+                    "ORDER BY seq", (analysis_id, cseq),
+                ).fetchall()
+            ]
+            edges = [
+                review.DagEdge(r["from_node"], r["to_node"], r["segment_id"], r["length_m"])
+                for r in conn.execute(
+                    "SELECT from_node, to_node, segment_id, length_m "
+                    "FROM analysis_connector_edges WHERE analysis_id = ? AND connector_seq = ? "
+                    "ORDER BY seq", (analysis_id, cseq),
+                ).fetchall()
+            ]
+            connectors.append((pieces, edges))
+    finally:
+        conn.close()
+
+    result = review.review_analysis(connectors, body.segment_ids)
+    return {"analysis_id": analysis_id,
+            "network_version": a["network_version"],
+            "segment_ids": body.segment_ids,
+            "reviewed_at": fmt_ts(utcnow()),
+            **result}
 
 
 @app.get("/health")

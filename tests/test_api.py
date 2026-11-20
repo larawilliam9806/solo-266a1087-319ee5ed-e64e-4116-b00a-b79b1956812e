@@ -1,10 +1,4 @@
 """端到端 API 测试:路网版本化、轨迹匹配、缺口、版本隔离。"""
-import os
-import tempfile
-
-# 必须在导入 app 之前指定独立数据库
-os.environ["DATABASE_PATH"] = os.path.join(tempfile.mkdtemp(prefix="trajtest_"), "test.db")
-
 from fastapi.testclient import TestClient
 
 from app import db

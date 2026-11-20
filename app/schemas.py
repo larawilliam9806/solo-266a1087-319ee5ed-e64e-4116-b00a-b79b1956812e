@@ -49,3 +49,17 @@ class TrajectoryCreate(BaseModel):
 class MatchRequest(BaseModel):
     trajectory_id: int
     network_version: str = Field(min_length=1, description="指定匹配使用的路网版本;一次分析只使用该版本快照")
+
+
+class ReviewRequest(BaseModel):
+    segment_ids: list[str] = Field(
+        min_length=1, description="该版路网的一组有向路段号;返回整份分析在这组路段上的最少/最多行驶米数")
+
+    @field_validator("segment_ids")
+    @classmethod
+    def unique_segment_ids(cls, v: list[str]) -> list[str]:
+        if any(not s or not s.strip() for s in v):
+            raise ValueError("segment_id 不能为空")
+        if len(v) != len(set(v)):
+            raise ValueError("segment_ids 不能重复")
+        return v

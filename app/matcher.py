@@ -36,6 +36,20 @@ def node_key(lat: float, lon: float) -> tuple[float, float]:
     return (round(lat, 6), round(lon, 6))
 
 
+def node_key_str(key: tuple[float, float]) -> str:
+    """图节点键的持久化表示。"""
+    return f"{key[0]},{key[1]}"
+
+
+def parse_node_key(s: str) -> tuple[float, float]:
+    la, lo = s.split(",")
+    return (float(la), float(lo))
+
+
+# 紧边判定容差(米):规避浮点求和误差
+TIGHT_EPS_M = 1e-9
+
+
 @dataclass
 class Segment:
     segment_id: str
@@ -80,6 +94,8 @@ class NetworkIndex:
         for i, s in enumerate(segments):
             self.adj.setdefault(s.start_node, []).append((s.end_node, s.length_m, i))
         self._sp_cache: dict[tuple[float, float], tuple[dict, dict]] = {}
+        # 紧边 DAG 缓存:(dist, [(u, v, seg_idx), ...]),按源点;路网快照不可变,缓存安全
+        self._dag_cache: dict[tuple[float, float], tuple[dict, list]] = {}
         # 候选预过滤包围盒
         self._bbox = [
             (min(s.start_lat, s.end_lat), min(s.start_lon, s.end_lon),
@@ -153,6 +169,79 @@ class NetworkIndex:
             pieces.append((si, 0.0, self.segments[si].length_m))
         pieces.append((b.seg_idx, 0.0, b.offset_m))
         return total, pieces
+
+    def tight_dag_from(self, src: tuple[float, float]):
+        """源点出发的全部最短路组成的紧边 DAG。
+
+        紧边条件:dist[x] + w(x->y) == dist[src->y](容差 1e-9m)。
+        满足该条件的边恰好落在 src 出发的某条最短路上。一次 Dijkstra +
+        对邻接表的线性扫描即可得到,**不枚举任何等长最短路线**。按源点缓存。
+        """
+        cached = self._dag_cache.get(src)
+        if cached is not None:
+            return cached
+        dist, _ = self.shortest_from(src)
+        edges: list[tuple[tuple[float, float], tuple[float, float], int]] = []
+        for u, nbrs in self.adj.items():
+            du = dist.get(u)
+            if du is None:
+                continue
+            for v, w, si in nbrs:
+                dv = dist.get(v)
+                if dv is not None and abs(du + w - dv) <= TIGHT_EPS_M:
+                    edges.append((u, v, si))
+        self._dag_cache[src] = (dist, edges)
+        return dist, edges
+
+    def connector_basis(self, a: Candidate, b: Candidate):
+        """生成候选 a -> b 的接续依据(以原匹配吸附点为准)。
+
+        返回 dict:
+          pieces: 首尾固定片段 [(seg_idx, from_offset, to_offset), ...],
+                  首尾路段只计实际经过的里程(同路段顺向时为一整段部分里程);
+          edges:  能到达 b 吸附点的紧边 DAG 边 [(u, v, seg_idx), ...],
+                  覆盖全部等长最短接续路线,但只存边不存路线。b 吸附在路段末端时,
+                  b 整条作为 DAG 的一条边(等长路线可能汇合于其终点),不作为固定片段;
+          total_m: 最短接续总里程。
+        不连通返回 None。
+        """
+        sa = self.segments[a.seg_idx]
+        sb = self.segments[b.seg_idx]
+        if a.seg_idx == b.seg_idx and b.offset_m >= a.offset_m - 1e-9:
+            # 同一条有向路段且顺向:没有中间图接续,全部里程为固定片段
+            return {"pieces": [(a.seg_idx, a.offset_m, b.offset_m)],
+                    "edges": [], "total_m": b.offset_m - a.offset_m}
+        dist, edges = self.tight_dag_from(sa.end_node)
+        if sb.start_node not in dist:
+            return None
+        # b 吸附在路段末端时,等长最短路线可能从其他路段直接汇入 b 的终点,
+        # 此时把 b 整条作为紧边 DAG 的一条边(而非固定片段),裁剪目标为 b 的终点;
+        # 否则图接续止于 b 的起点,b 的前缀里程作为固定片段。
+        full_b = b.offset_m >= sb.length_m - 1e-9
+        target_node = sb.end_node if full_b else sb.start_node
+        if target_node not in dist:
+            return None
+        # 反向可达性:只保留能到达吸附点的紧边,复核 DP 时无需再处理死路
+        radj: dict[tuple[float, float], list] = {}
+        for u, v, si in edges:
+            radj.setdefault(v, []).append((u, si))
+        reachable = {target_node}
+        stack = [target_node]
+        while stack:
+            node = stack.pop()
+            for pu, _ in radj.get(node, ()):
+                if pu not in reachable:
+                    reachable.add(pu)
+                    stack.append(pu)
+        kept = [(u, v, si) for u, v, si in edges if v in reachable]
+        pieces = [(a.seg_idx, a.offset_m, sa.length_m)]
+        if not full_b:
+            pieces.append((b.seg_idx, 0.0, b.offset_m))
+        if full_b:
+            total = (sa.length_m - a.offset_m) + dist[sb.end_node]
+        else:
+            total = (sa.length_m - a.offset_m) + dist[sb.start_node] + b.offset_m
+        return {"pieces": pieces, "edges": kept, "total_m": total}
 
     # --------------------------------------------------------------- Viterbi
     def _viterbi(self, pts: list[TrackPoint], cands: list[list[Candidate]]):
@@ -270,6 +359,16 @@ class NetworkIndex:
                 visits.extend(v)
                 ranges.append((idxs[0], idxs[-1]))
 
+        # 2.1) 接续依据:每对连续采样一条,只在同一连续段内生成;
+        #      缺口两侧分属不同 run,天然不接续。依据只存固定片段 + 紧边 DAG,不枚举路线。
+        connector_bases: list[dict] = []
+        for idxs, path in pieces:
+            chosen = [cands[i][p] for i, p in zip(idxs, path)]
+            for k in range(len(chosen) - 1):
+                basis = self.connector_basis(chosen[k], chosen[k + 1])
+                if basis is not None:
+                    connector_bases.append(basis)
+
         # 3) 缺口
         gaps: list[dict] = []
         if not ranges:
@@ -308,4 +407,5 @@ class NetworkIndex:
             "total_distance_m": round(sum(v[3] for v in visits), 3),
             "path": path_json,
             "gaps": gaps,
+            "connector_bases": connector_bases,
         }
